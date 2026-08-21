@@ -1,0 +1,18 @@
+# 彩票预测服务统一依赖 (lotto + lotti-analyzer)
+# 生成于 2026-08-21，基于当前运行环境实测版本
+# 安装: pip install -r requirements.txt
+# Python 要求: 3.10+ (实测 3.11/3.13 均可)
+
+# ── Web 服务 (services/lotto, Streamlit) ──
+streamlit>=1.57.0
+pandas>=3.0.0
+numpy>=2.0.0
+requests>=2.32.0
+beautifulsoup4>=4.14.0
+lxml>=6.0.0
+scikit-learn>=1.8.0
+scipy>=1.17.0
+
+# ── CLI 分析器 (services/lotti-analyzer) ──
+matplotlib>=3.10.0
+seaborn>=0.13.0
