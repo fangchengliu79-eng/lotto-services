@@ -319,6 +319,23 @@ class SpiralMatrixPredictor:
         main_win_prob = (main_win + 1) / (main_win.sum() + main_range_size)
         sub_win_prob = (sub_win + 1) / (sub_win.sum() + sub_range_size)
 
+        # ── 相邻期蓝球去重 —— 规则 v3（2026-10-20）──
+        # 双色球：上一期猜中的蓝球，本期 0 组；其余情况全部放行（沿用原算法）。
+        # 大乐透：沿用原"次数配额"逻辑不变。
+        _latest_data_period = int(df.iloc[0]["period"])
+        if cfg.short == "dlt":
+            from models.ensemble import _load_blue_period_history, _blue_caps
+            _prev_sub, _recent_sub = _load_blue_period_history(
+                cfg, "spiral_matrix", periods=3, max_period=_latest_data_period)
+            blue_caps = _blue_caps(_prev_sub, _recent_sub, sub_min, sub_max,
+                                   base_cap=3, needed_slots=sub_k * num_groups)
+        else:
+            from models.ensemble import _load_blue_prev_hits, _blue_caps_hit_only
+            _drawn_sub = [int(df.iloc[0][c]) for c in cfg.sub_cols]
+            _prev_hit_blues = _load_blue_prev_hits(
+                cfg, _latest_data_period, _drawn_sub, "spiral_matrix")
+            blue_caps = _blue_caps_hit_only(_prev_hit_blues, sub_min, sub_max, base_cap=3)
+
         def _pick_top_n(probs, n):
             ranked = sorted([(i + main_min, probs[i]) for i in range(len(probs))], key=lambda x: -x[1])
             return [num for num, _ in ranked[:n]]
@@ -434,8 +451,16 @@ class SpiralMatrixPredictor:
             if not combos:
                 return None
 
-            # 蓝球: 根据本策略的概率分布加权选取
+            # 蓝球: 根据本策略的概率分布加权选取（叠加相邻期去重配额）
             sp = sub_probs if sub_probs is not None else sub_decay_prob
+            sp = np.array(sp, dtype=float)
+            for _bn in range(sub_min, sub_max + 1):
+                if used_sub_counts.get(_bn, 0) >= blue_caps.get(_bn, 3):
+                    sp[_bn - sub_min] = 0.0
+            if sp.sum() <= 0:
+                sp = np.array(sub_probs if sub_probs is not None else sub_decay_prob, dtype=float)
+            sp = np.maximum(sp, 1e-12)
+            sp = sp / sp.sum()
             best_back = _pick_sub_weighted(sp, sub_k)
 
             # CRF优选: 结构评分 + 概率评分 + DLT形态评分

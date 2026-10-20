@@ -76,6 +76,131 @@ def _load_prediction_history_counts(cfg, max_records: int = 10):
     return main_counts, sub_counts, main_pairs, sub_pairs
 
 
+# ========================================================================
+# 相邻期蓝球去重 —— 规则 v3（2026-10-20，用户最终确认）
+# 唯一违规情形：上一期蓝球已经"猜中"（该期实际开出的蓝球就在我们的推荐里），
+#               本期还继续推荐同一个蓝球 -> 该号本期 0 组。
+# 其余情况全部放行，沿用原算法：
+#   * 上一期推过但没猜中        -> 本期可以继续推
+#   * 近3期推荐次数偏多         -> 本期可以继续推
+#   * 同期内蓝球重复            -> 允许（仍受通用规则：单号≤3次、号码对≤3次）
+# 只看上一期，只作用一期：过了这一期，被猜中的号自动解除限制。
+# ========================================================================
+def _load_blue_prev_hits(cfg, prev_period, drawn_sub, algorithm: str = "ensemble"):
+    """返回上一期"猜中"的蓝球集合（上期实际开出且我们推荐过的号）。
+
+    Args:
+        prev_period: 上一个已开奖期号（df 最新一行）
+        drawn_sub:   上一期实际开出的蓝球列表
+        algorithm:   只看该算法自己的推荐记录（ensemble / spiral_matrix / all）
+    """
+    drawn = set()
+    for n in (drawn_sub or []):
+        try:
+            drawn.add(int(n))
+        except Exception:
+            continue
+    if not drawn:
+        return set()
+    try:
+        preds = get_all_predictions(cfg)
+    except Exception:
+        return set()
+    hits = set()
+    for p in preds:
+        if algorithm != "all" and p.get("algorithm", "ensemble") != algorithm:
+            continue
+        if str(p.get("period", "")) != str(prev_period):
+            continue
+        for g in (p.get("recommendations") or []):
+            for n in (g.get("sub") or []):
+                try:
+                    n = int(n)
+                except Exception:
+                    continue
+                if n in drawn:
+                    hits.add(n)
+    return hits
+
+
+def _blue_caps_hit_only(hit_nums, sub_min: int, sub_max: int, base_cap: int = 3):
+    """本期每个蓝球允许出现的组数：上一期猜中的号 0 组，其余一律 base_cap（默认3）。"""
+    hits = set(hit_nums or ())
+    return {n: (0 if n in hits else base_cap)
+            for n in range(sub_min, sub_max + 1)}
+
+
+# ------------------------------------------------------------------------
+# 旧"次数配额"逻辑（仅大乐透沿用，双色球已改为上面的规则 v3）
+# ========================================================================
+def _load_blue_period_history(cfg, algorithm: str = "ensemble",
+                              periods: int = 3, max_period: Optional[int] = None):
+    """读取本算法最近 periods 期的蓝球推荐次数（只看已开奖期，排除当前待开奖期）。
+
+    Returns:
+        (prev_counts, recent_counts)
+        prev_counts:   上一期每个蓝球被推荐了几次，如 {4: 3}
+        recent_counts: 最近 periods 期每个蓝球累计被推荐了几次
+    """
+    prev_counts, recent_counts = {}, {}
+    try:
+        preds = [p for p in get_all_predictions(cfg)
+                 if p.get("status") in ("active", "completed")]
+        if algorithm != "all":
+            preds = [p for p in preds if p.get("algorithm", "ensemble") == algorithm]
+    except Exception:
+        preds = []
+    # 排除"当前待开奖期"的记录：期号大于最新开奖期的一律不算历史，
+    # 否则重新生成同一期时，会把这一期自己的旧推荐当成"上一期"。
+    if max_period is not None:
+        kept = []
+        for p in preds:
+            try:
+                if int(str(p.get("period", "0"))) <= int(max_period):
+                    kept.append(p)
+            except Exception:
+                continue
+        preds = kept
+    preds.sort(key=lambda p: str(p.get("period", "")), reverse=True)
+    for rank, p in enumerate(preds[:periods]):
+        for g in p.get("recommendations", []):
+            for n in g.get("sub", []):
+                recent_counts[n] = recent_counts.get(n, 0) + 1
+                if rank == 0:
+                    prev_counts[n] = prev_counts.get(n, 0) + 1
+    return prev_counts, recent_counts
+
+
+def _blue_caps(prev_counts, recent_counts, sub_min: int, sub_max: int,
+               base_cap: int = 3, needed_slots: int = 5):
+    """每个蓝球本期允许出现的组数（与号码身份无关，只看过往推荐次数）。
+
+    用户明确要求（2026-10-20）：**调低权重，不等于完全禁止** ——
+    蓝球在同期内仍然可以适当重复出现。因此这里没有任何号码会被压到 0：
+    过度使用的号码本期最多占 1 组（软压制），其余号码仍可占 3 组（同期重复照旧）。
+    """
+    caps = {}
+    for n in range(sub_min, sub_max + 1):
+        r3 = recent_counts.get(n, 0)
+        p1 = prev_counts.get(n, 0)
+        if r3 >= 3 or p1 >= 1:
+            caps[n] = 1          # 上一期推过 / 近3期已偏多：本期最多 1 组（不封杀）
+        elif r3 == 2:
+            caps[n] = 2          # 略有堆积：本期最多 2 组
+        else:
+            caps[n] = base_cap   # 未受限：同一期仍可重复到 base_cap（默认3）
+    # 可行性兜底：若总容量不足以填满本期蓝球位，按最近推荐次数从少到多放开
+    guard = 0
+    while sum(caps.values()) < needed_slots and guard < 100:
+        guard += 1
+        cands = [n for n in caps if caps[n] < base_cap]
+        if not cands:
+            break
+        c = min(cands, key=lambda n: (recent_counts.get(n, 0), n))
+        caps[c] += 1
+    return caps
+
+
 
 class EnsembleModel:
     """Weighted ensemble of multiple prediction models."""
@@ -633,6 +758,31 @@ def generate_recommendations(
     dlt_cold_filter = (lambda v: _check_dlt_zone(v, cold_mode=True)) if is_dlt else None
     dlt_candidates = 1200 if is_dlt else 500  # DLT需要更多候选以找到符合区间分布的
 
+    # ── 相邻期蓝球去重 —— 规则 v3（2026-10-20，仅双色球改）──
+    # 双色球：唯一违规情形 = 上一期蓝球已猜中，本期还推荐同一个号（该号本期 0 组）。
+    #         上一期推过但没中 / 近3期推得多 / 同期重复 -> 全部照旧放行。
+    # 大乐透：沿用原"次数配额"逻辑，不做改动。
+    _latest_data_period = int(df.iloc[0]["period"])
+    if is_dlt:
+        _prev_sub_counts, _recent_sub_counts = _load_blue_period_history(
+            cfg, "ensemble", periods=3, max_period=_latest_data_period)
+        blue_caps = _blue_caps(_prev_sub_counts, _recent_sub_counts,
+                               cfg.sub_min, cfg.sub_max,
+                               base_cap=3, needed_slots=cfg.sub_count * num_groups)
+    else:
+        _drawn_sub = [int(df.iloc[0][c]) for c in cfg.sub_cols]
+        _prev_hit_blues = _load_blue_prev_hits(
+            cfg, _latest_data_period, _drawn_sub, "ensemble")
+        blue_caps = _blue_caps_hit_only(_prev_hit_blues, cfg.sub_min, cfg.sub_max,
+                                        base_cap=3)
+        if _prev_hit_blues:
+            get_logger(cfg).info(
+                f"蓝球规则v3: 上期{_latest_data_period}猜中 {sorted(_prev_hit_blues)}，本期不再推荐")
+
+    def _cap_ok(sub_result):
+        """当前这一注的蓝球是否在配额内（配合已用次数判断）。"""
+        return all(used_sub_counts.get(n, 0) < blue_caps.get(n, 3) for n in sub_result)
+
     # 历史预测记忆（仅大乐透）：统计最近10期 ensemble 推荐中号码/号码对的出现次数，
     # 对反复推荐的号码施加惩罚 → 跨期轮换，避免死守同一组冷号。
     hist_main_counts = {}
@@ -886,6 +1036,11 @@ def generate_recommendations(
                                 if 0 <= idx < sub_n:
                                     s_strat[idx] *= 0.50
 
+                # ── 相邻期蓝球去重（与具体号码无关）：超配额的蓝球清零 ──
+                for _bn in range(cfg.sub_min, cfg.sub_max + 1):
+                    if used_sub_counts.get(_bn, 0) >= blue_caps.get(_bn, 3):
+                        s_strat[_bn - cfg.sub_min] = 0.0
+
                 m_strat = np.maximum(m_strat, 1e-10)
                 m_strat = m_strat / m_strat.sum()
                 s_strat = np.maximum(s_strat, 1e-10)
@@ -947,20 +1102,31 @@ def generate_recommendations(
         # ════════════════════════════════════════════════════════════════════
 
         def _run_ssq_strategy(strat_m, strat_s, seed, n_candidates, pattern_filter):
-            """运行单策略 + 约束检查重试 + 约束更新（双色球分支）。"""
+            """运行单策略 + 相邻期蓝球去重 + 约束检查重试 + 约束更新（双色球分支）。"""
+            # 只对蓝球做相邻期去重：超出配额的蓝球概率清零（同期限3组不冲突）
+            ss_base = np.array(strat_s, dtype=float)
+            for _bn in range(cfg.sub_min, cfg.sub_max + 1):
+                if used_sub_counts.get(_bn, 0) >= blue_caps.get(_bn, 3):
+                    ss_base[_bn - cfg.sub_min] = 0.0
+            if ss_base.sum() <= 0:
+                ss_base = np.array(strat_s, dtype=float)
+            ss_base = np.maximum(ss_base, 1e-12)
+            ss_base = ss_base / ss_base.sum()
+
             main_result, sub_result = _run_strategy(
-                strat_m, strat_s, seed,
+                strat_m, ss_base, seed,
                 n_candidates=n_candidates,
                 pattern_filter=pattern_filter
             )
-            # 不满足约束则重试（换种子，最多2次）
+            # 不满足约束（或蓝球超配额）则重试（换种子，最多2次）
             max_retries = 2
             retry_count = 0
-            while not _check_constraints(main_result, sub_result) and retry_count < max_retries:
+            while (not _check_constraints(main_result, sub_result) or not _cap_ok(sub_result)) \
+                    and retry_count < max_retries:
                 retry_count += 1
                 new_seed = seed + retry_count * 137
                 main_result, sub_result = _run_strategy(
-                    strat_m, strat_s, new_seed,
+                    strat_m, ss_base, new_seed,
                     n_candidates=n_candidates * (1 + retry_count),
                     pattern_filter=pattern_filter
                 )

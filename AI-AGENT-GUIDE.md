@@ -2,7 +2,7 @@
 
 > **阅读对象**: 新安装的 AI agent（Hermes、Claude、ChatGPT、或其他任何 AI 助手）
 > **任务**: 读取本文件后，在新机器上完整重建主人的两个彩票预测服务
-> **版本**: 2026-08-21 (v1.0) — 请勿删除或重命名本文件，这是恢复服务的唯一入口文档
+> **版本**: 2026-10-20 (v1.1) — 双色球蓝球规则 v3 已入库；请勿删除或重命名本文件，这是恢复服务的唯一入口文档
 
 ---
 
@@ -47,6 +47,31 @@ systemctl status lotto-web.service        # 应显示 active (running)
 ```
 
 如果环境中没有 systemd（如容器），用 `bash setup.sh --no-systemd`，脚本会打印手动启动命令。
+
+### 2.1 迁移验证清单（安装后逐条过，缺一不可）
+
+```bash
+cd services/lotto
+
+# 1) 依赖链自检（setup.sh 已内置，这里可复跑）
+../.venv/bin/python3 -c "import config_ssq; from models.ensemble import generate_recommendations; \
+from models.spiral_matrix import SpiralMatrixPredictor; from utils.prizes import evaluate; print('OK')"
+
+# 2) 蓝球规则 v3 自检（只读，不写预测文件）—— 必须打印「全部通过 ✓」
+../.venv/bin/python3 _verify_blue_rule_v3.py | tail -8
+
+# 3) 页面可达 + 双算法都有当期预测
+curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:8502/
+../.venv/bin/python3 -c "
+from config_ssq import SSQ; from utils.predictions import _load_all
+ps=[p for p in _load_all(SSQ) if p['status']=='active']
+print('active 预测:', [(p['algorithm'], p['period']) for p in ps])"
+
+# 4) 大乐透未被蓝球规则影响（应正常输出 5 组）
+../.venv/bin/python3 _dryrun_dlt_check.py | tail -6
+```
+
+数据文件若为旧快照，首次点页面「🔄 重新计算」会增量拉取最新开奖后重新生成。
 
 ---
 
@@ -98,6 +123,7 @@ services/lotto/
 │   ├── timeseries.py       # ExponentialSmoothingModel
 │   └── ml_models.py        # LSTM / XGBoost / RandomForest (备用)
 ├── utils/predictions.py    # 预测封存与比对 (每期独立文件存储)
+├── utils/prizes.py         # 奖金计算 (双色球 1-6 等奖 / 大乐透 1-9 等奖, 含浮动奖估算)
 ├── data/
 │   ├── dlt/dlt_history.csv       # 大乐透历史 (201期)
 │   ├── dlt/predictions.json      # 联合索引
@@ -115,13 +141,22 @@ services/lotto/
 5. **只比对当期**: 每条预测只与自己期号的开奖结果比对，绝不跨期
 6. **永不删除预测记录**: 历史预测对主人有参考价值。`_save_all` 最多保留 20 条（active + completed），这是系统既定行为
 7. **数据真实性**: 绝不使用合成数据冒充真实开奖。数据源: CWL API (SSQ) + 500.com HTML (DLT)
+8. **双色球蓝球规则 v3（2026-10-20，唯一违规情形）**: **上一期已经猜中的蓝球，本期不允许再推荐（0 组）**。
+   - 「猜中」判定: 上期实际开出的蓝球 ∈ 上期该算法推荐 → 该号本期 `cap=0`
+   - 其余全部放行: 上期推过但没中 / 近3期推得多 / 同期内重复 都照旧（通用规则: 单号 ≤3、号码对 ≤3）
+   - 只作用紧接着的一期，下一期自动解禁；`ensemble` 与 `spiral_matrix` 各按自己的历史判定
+   - 实现: `models/ensemble.py` 的 `_load_blue_prev_hits()` + `_blue_caps_hit_only()`；接入点 `generate_recommendations()`(SSQ 分支) 与 `SpiralMatrixPredictor.predict()`
+   - **大乐透不变**: 仍走 `_load_blue_period_history()` + `_blue_caps()` 的「次数配额」(上期推过→1组，近3期≥3次→1组，其余3组)
+   - ⚠️ 不要再退回旧规则（用次数配额压蓝球、或干脆按号码封杀），用户明确只要这一种违规情形
+   - 验收: `cd services/lotto && python3 _verify_blue_rule_v3.py`（只读，不写任何预测文件）
 
-**修改算法后必须**:
+**修改算法后必须**（不要手动删文件：`save_prediction` 会原位替换同期同算法的 active 记录，completed 历史永久保留）：
 ```bash
-# 1. 删除当前 active 预测 (保留 completed)
-# 2. 重新生成预测
-# 3. 重启服务
-cd services/lotto && kill $(pgrep -f "streamlit run app.py") ; streamlit run app.py --server.port 8502 --server.headless true
+# 1. 用维护脚本重算当前期（双算法，不删任何历史）
+cd services/lotto && ../.venv/bin/python3 _regen_ssq_v3.py
+# 2. 重启服务
+kill $(pgrep -f "streamlit run app.py") ; \
+  ../.venv/bin/streamlit run app.py --server.port 8502 --server.headless true >> ../../logs/lotto.log 2>&1 &
 ```
 
 ### 4.2 服务 2: lotti-analyzer（CLI）
@@ -133,7 +168,8 @@ services/lotti-analyzer/
 ├── config.py               # 配置 (FRONT_MAX 等常量)
 ├── data_fetcher.py         # 数据加载 (含内置 30 期真实数据)
 ├── analysis/statistics.py  # 统计分析
-├── models/                 # 统计模型 (frequency/poisson/exponential/monte_carlo)
+├── models/                 # 统计模型 (frequency/poisson/exponential/monte_carlo + ensemble)
+├── utils/                  # helpers.py / predictions.py (_cron_dlt_direct 依赖, 缺了会崩)
 ├── data/dlt_history.csv    # 大乐透历史 (30期, 内置)
 └── data/predictions.json   # 预测记录 (2条)
 ```

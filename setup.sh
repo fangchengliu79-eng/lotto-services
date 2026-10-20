@@ -85,7 +85,12 @@ cd "$SERVICE_DIR/lotti-analyzer"
 "$PYBIN" -c "
 import sys; sys.path.insert(0, '.')
 import config, data_fetcher
-print('✅ lotti-analyzer: 模块导入成功')
+from analysis.statistics import frequency_analysis, hot_cold_analysis, comprehensive_analysis
+from models.statistical import FrequencyModel, PoissonModel, MonteCarloModel
+from models.timeseries import ExponentialSmoothingModel
+from models.ensemble import EnsembleModel, generate_recommendations
+from utils.helpers import format_numbers
+print('✅ lotti-analyzer: 模块导入成功 (含 _cron_dlt_direct 依赖链)')
 " || { echo "❌ lotti-analyzer 自检失败"; exit 1; }
 cd "$INSTALL_ROOT"
 echo "✅ 代码自检通过"
