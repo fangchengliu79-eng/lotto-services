@@ -11,6 +11,8 @@ venv/
 
 # Data
 data/*.csv
+# 迁移必需: 分析器真实历史数据需入库, 否则新机器首次运行无数据 (备份文件仍忽略)
+!data/dlt_history.csv
 data/models/
 output/
 
